@@ -34,6 +34,8 @@
 #include "checkpoint.h"
 #include "codegen/gen_rpc_ids.h"
 #include "cuda_server.h"
+#include "dedup_cache.h"
+#include "dedup_protocol.h"
 #include "server_checkpoint.h"
 #endif
 
@@ -187,6 +189,18 @@ int rpc_server_dispatch(const rpc_handler_registry &handlers, conn_t *conn,
   if (op == LUPINE_RPC_CLIENT_METADATA) {
     return handle_lupine_client_metadata(conn);
   }
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  if (op == LUPINE_RPC_DEDUP_BULK_CHUNK) {
+    return handle_lupineDedupBulkChunk(conn);
+  }
+  if (op == LUPINE_RPC_DEDUP_TRANSFER || op == LUPINE_RPC_DEDUP_COMMIT) {
+    lupine_checkpoint::cuda_call_guard guard;
+    int result = op == LUPINE_RPC_DEDUP_TRANSFER
+                     ? handle_lupineDedupTransfer(conn)
+                     : handle_lupineDedupCommit(conn);
+    return result >= 0 ? 0 : -1;
+  }
+#endif
   auto it = handlers.find(op);
   if (it == handlers.end()) {
     LUPINE_LOG_ERROR("No RPC handler for op " << op << "; closing client.");
@@ -337,6 +351,7 @@ static void lupine_serve_bulk_connection(int fd,
   }
 #ifdef LUPINE_BUILD_CUDA_BACKEND
   lupine_server_bulk_connection_lost();
+  lupine_server_dedup_bulk_connection_lost();
 #endif
   rpc_conn_destroy(&conn);
 }
@@ -357,6 +372,7 @@ int client_handler(lupine_socket_t connfd) {
 #endif
       lupine_child_bulk_token.empty() ? nullptr
                                       : lupine_child_bulk_token.c_str(),
+      lupine_dedup_cache_enabled(),
   };
 
   // Identify the protocol before any RPC state exists: HTTP/2 preface means

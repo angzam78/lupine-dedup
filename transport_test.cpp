@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <future>
+#include <limits>
 #include <stdio.h>
 #include <string>
 #include <thread>
@@ -21,6 +22,46 @@ void check(bool ok, const char *what) {
   if (!ok) {
     ++failures;
   }
+}
+
+void test_parse_sizes() {
+  struct valid_case {
+    const char *text;
+    uint64_t bytes;
+  };
+  const valid_case valid[] = {
+      {"0", 0},
+      {"4096", 4096},
+      {"4096B", 4096},
+      {"64K", 64ull << 10},
+      {"64KiB", 64ull << 10},
+      {"512M", 512ull << 20},
+      {"512MB", 512ull << 20},
+      {"2MiB", 2ull << 20},
+      {"64G", 64ull << 30},
+      {"1GiB", 1ull << 30},
+      {"2T", 2ull << 40},
+      {" 16G ", 16ull << 30},
+      {"8 G", 8ull << 30},
+  };
+  for (const auto &test : valid) {
+    uint64_t parsed = std::numeric_limits<uint64_t>::max();
+    check(lupine_parse_size(test.text, &parsed) && parsed == test.bytes,
+          test.text);
+  }
+
+  const char *invalid[] = {
+      "", "-1", "+1", "1.5G", "1P", "1Ki", "1Gjunk",
+      "18446744073709551616", "18446744073709551615K"};
+  for (const char *text : invalid) {
+    uint64_t parsed = 123;
+    check(!lupine_parse_size(text, &parsed), text);
+  }
+
+  uint64_t parsed = 123;
+  check(!lupine_parse_size(nullptr, &parsed), "null input");
+  check(!lupine_parse_size("1G", nullptr), "null output");
+  check(parsed == 123, "invalid parse leaves output unchanged");
 }
 
 // A listening loopback socket plus the port it landed on. Port 0 lets the OS
@@ -130,6 +171,7 @@ void test_teardown_completes_after_an_abrupt_peer_close() {
 } // namespace
 
 int main() {
+  test_parse_sizes();
   test_client_dial_starts_the_socket_layer();
   test_teardown_completes_after_an_abrupt_peer_close();
   printf("\ntransport_test: %s\n", failures == 0 ? "PASS" : "FAIL");

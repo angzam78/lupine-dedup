@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1.7
+
+ARG CUDA_VERSION=12.8.0
+ARG UBUNTU_VERSION=24.04
+ARG TORCH_CUDA_INDEX=cu128
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS lupine-client-build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        libnghttp2-dev \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/lupine-src
+COPY . /opt/lupine-src
+
+RUN cmake -S /opt/lupine-src -B /opt/lupine-src/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+    && cmake --build /opt/lupine-src/build --parallel --target lupine_cuda_client \
+    && mkdir -p /opt/lupine/lib \
+    && cp /opt/lupine-src/build/libcuda.so.1 /opt/lupine/lib/libcuda.so.1 \
+    && ln -sf libcuda.so.1 /opt/lupine/lib/libcuda.so
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+
+ARG TORCH_CUDA_INDEX
+ARG COMFYUI_REF=master
+ARG COMFYUI_MANAGER_REF=main
+
+ENV PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    COMFYUI_ROOT=/app/ComfyUI \
+    LUPINE_LIBCUDA=/opt/lupine/lib/libcuda.so.1 \
+    LUPINE_LIB=/opt/lupine/lib/libcuda.so.1 \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/opt/lupine/lib:/usr/local/cuda/lib64
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        build-essential \
+        ffmpeg \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv "$VIRTUAL_ENV"
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir \
+        --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_INDEX}" \
+        torch torchvision torchaudio \
+    && pip install --no-cache-dir huggingface_hub
+
+WORKDIR /app
+RUN git clone --depth 1 --branch "$COMFYUI_REF" \
+        https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_ROOT" \
+    && git clone --depth 1 --branch "$COMFYUI_MANAGER_REF" \
+        https://github.com/ltdrdata/ComfyUI-Manager.git \
+        "$COMFYUI_ROOT/custom_nodes/ComfyUI-Manager"
+
+WORKDIR $COMFYUI_ROOT
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir \
+        -r custom_nodes/ComfyUI-Manager/requirements.txt
+
+COPY deploy/entrypoint-comfyui-ltxv.sh /usr/local/bin/entrypoint-comfyui-ltxv
+RUN chmod 0755 /usr/local/bin/entrypoint-comfyui-ltxv
+
+EXPOSE 1234
+ENTRYPOINT ["/usr/local/bin/entrypoint-comfyui-ltxv"]
+CMD ["--listen", "0.0.0.0", "--port", "1234"]

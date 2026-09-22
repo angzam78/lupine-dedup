@@ -592,6 +592,8 @@ if(LUPINE_BUILD_SERVER)
     if(LUPINE_BUILD_CUDA)
         add_library(lupine_cuda_server STATIC
             ${CMAKE_CURRENT_SOURCE_DIR}/server_checkpoint.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/dedup_cache.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/dedup_transfer.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cuda_server.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cuda_server_memcpy.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_cuda_server.cpp
@@ -769,6 +771,16 @@ if(BUILD_TESTING)
     target_link_libraries(transport_test PRIVATE lupine_rpc_core)
     lupine_apply_sanitizer(transport_test)
     add_test(NAME transport_test COMMAND transport_test)
+
+    add_executable(dedup_cache_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/dedup_cache_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/dedup_cache.cpp)
+    target_include_directories(dedup_cache_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lib)
+    target_link_libraries(dedup_cache_test PRIVATE lupine_lz4 Threads::Threads)
+    lupine_apply_sanitizer(dedup_cache_test)
+    add_test(NAME dedup_cache_test COMMAND dedup_cache_test)
 
     add_executable(visible_devices_test
         ${CMAKE_CURRENT_SOURCE_DIR}/visible_devices_test.cpp

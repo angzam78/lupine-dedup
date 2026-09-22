@@ -1,6 +1,91 @@
 #ifndef LUPINE_PLATFORM_H
 #define LUPINE_PLATFORM_H
 
+#include <cctype>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+
+// Parses a non-negative integer with an optional binary capacity suffix.
+// Bare values are bytes; K/M/G/T and KiB/MiB/GiB/TiB use powers of 1024.
+inline bool lupine_parse_size(const char *text, uint64_t *bytes) {
+  if (text == nullptr || bytes == nullptr || *text == '\0') {
+    return false;
+  }
+  const char *input = text;
+  while (*input != '\0' &&
+         std::isspace(static_cast<unsigned char>(*input))) {
+    ++input;
+  }
+  if (*input == '\0' || *input == '+' || *input == '-') {
+    return false;
+  }
+
+  errno = 0;
+  char *number_end = nullptr;
+  unsigned long long number = std::strtoull(input, &number_end, 10);
+  if (number_end == input || errno == ERANGE ||
+      number > std::numeric_limits<uint64_t>::max()) {
+    return false;
+  }
+
+  const char *suffix = number_end;
+  while (*suffix != '\0' && std::isspace(static_cast<unsigned char>(*suffix))) {
+    ++suffix;
+  }
+  if (*suffix == '\0') {
+    *bytes = static_cast<uint64_t>(number);
+    return true;
+  }
+
+  size_t suffix_length = std::strlen(suffix);
+  while (suffix_length != 0 &&
+         std::isspace(static_cast<unsigned char>(suffix[suffix_length - 1]))) {
+    --suffix_length;
+  }
+  if (suffix_length == 0 || suffix_length > 3) {
+    return false;
+  }
+
+  char normalized[4] = {};
+  for (size_t i = 0; i < suffix_length; ++i) {
+    normalized[i] = static_cast<char>(std::toupper(
+        static_cast<unsigned char>(suffix[i])));
+  }
+  normalized[suffix_length] = '\0';
+
+  const char unit = normalized[0];
+  const bool byte_suffix = suffix_length == 1 && unit == 'B';
+  const bool valid_unit =
+      unit == 'K' || unit == 'M' || unit == 'G' || unit == 'T';
+  const bool valid_suffix =
+      suffix_length == 1 ||
+      (suffix_length == 2 && normalized[1] == 'B') ||
+      (suffix_length == 3 && normalized[1] == 'I' && normalized[2] == 'B');
+  if (!byte_suffix && (!valid_unit || !valid_suffix)) {
+    return false;
+  }
+
+  unsigned int exponent = 0;
+  if (!byte_suffix) {
+    exponent = unit == 'K' ? 1 : unit == 'M' ? 2 : unit == 'G' ? 3 : 4;
+  }
+  uint64_t multiplier = 1;
+  for (unsigned int i = 0; i < exponent; ++i) {
+    if (multiplier > std::numeric_limits<uint64_t>::max() / 1024) {
+      return false;
+    }
+    multiplier *= 1024;
+  }
+  if (number > std::numeric_limits<uint64_t>::max() / multiplier) {
+    return false;
+  }
+  *bytes = static_cast<uint64_t>(number) * multiplier;
+  return true;
+}
+
 #if __has_include(<elf.h>)
 #include <elf.h>
 #else

@@ -69,6 +69,53 @@ the mapping between client identity, the Lupine connection child, and the host
 PID reported by NVML. Values are collected when `/metrics` is requested, so
 the server does no background NVML polling.
 
+## HtoD Deduplication Cache
+
+LUPINE can deduplicate repeated large synchronous pageable host-to-device (HtoD)
+transfers over the existing HTTP/2 bulk lanes. The client negotiates a manifest
+of 4 MiB chunks using streamed XXH64-derived keys. Chunks already present on the
+server are reused; missing chunks are uploaded and admitted to the persistent
+server cache. If the cache is not configured, the peer does not advertise
+support, or negotiation fails, the transfer uses the existing bulk path.
+
+Enable the cache on the GPU server with both variables:
+
+```bash
+LUPINE_DEDUP_CACHE_DIR=/var/cache/lupine/dedup \
+LUPINE_DEDUP_CACHE_SIZE=64GiB \
+./build/lupine_driver_server
+```
+
+`LUPINE_DEDUP_CACHE_SIZE` accepts bytes or binary capacity suffixes such as
+`K`, `M`, `G`, `T`, `KiB`, `MiB`, `GiB`, and `TiB`. The server creates the cache
+directory when needed. The cache is server-local and should be placed on storage
+with enough capacity for the repeated transfer working set.
+
+Deduplication is intentionally limited to large synchronous contiguous pageable
+HtoD transfers that already use bulk lanes. Small transfers, device-to-host
+transfers, asynchronous and strided copies, callbacks, and special paths retain
+their existing behavior.
+
+## ComfyUI client image
+
+`deploy/Dockerfile.comfyui-ltxv` builds a CPU-side image containing ComfyUI,
+ComfyUI-Manager, and the LUPINE CUDA driver shim. It deliberately does not
+clone LTXV or VideoHelperSuite nodes and does not download model weights; add
+those through Manager or a mounted model/custom-node volume after the image is
+built. ComfyUI listens on container port `1234`.
+
+```bash
+docker build -f deploy/Dockerfile.comfyui-ltxv \
+  -t lupine-comfyui:latest .
+docker run --rm \
+  -p 1234:1234 \
+  -e LUPINE_SERVER=<gpu-server>:14833 \
+  lupine-comfyui:latest
+```
+
+Open `http://localhost:1234`. The client container does not need `--gpus all`;
+CUDA calls are sent through the LUPINE shim to the remote GPU server.
+
 ## Client compatibility
 
 Each production server executable embeds the matching Linux, macOS, and

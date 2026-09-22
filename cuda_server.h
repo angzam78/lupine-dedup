@@ -103,6 +103,10 @@ void lupine_server_cleanup_connection(conn_t *conn);
 // Fails every copy still waiting for chunks: a lost bulk connection can never
 // deliver them.
 void lupine_server_bulk_connection_lost();
+void lupine_server_dedup_bulk_connection_lost();
+int handle_lupineDedupTransfer(conn_t *conn);
+int handle_lupineDedupBulkChunk(conn_t *conn);
+int handle_lupineDedupCommit(conn_t *conn);
 void lupine_server_cleanup_log_callbacks(conn_t *conn);
 
 int handle_cuDevicePrimaryCtxRetain(conn_t *conn);

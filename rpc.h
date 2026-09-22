@@ -288,6 +288,7 @@ struct rpc_http2_server_metadata {
   const char *backend_version = nullptr;
   const lupine_client_bundle_registry *client_bundles = nullptr;
   const char *bulk_token = nullptr;
+  bool dedup_enabled = false;
 };
 // The server routes extra TCP connections that open with the bulk preamble
 // into the session named by the token it handed out in its handshake response.
@@ -305,6 +306,7 @@ extern const char *rpc_http2_client_probe(conn_t *conn);
 // The bulk-connection token the server handed out, or nullptr. Valid until
 // rpc_http2_destroy().
 extern const char *rpc_http2_peer_bulk_token(conn_t *conn);
+extern bool rpc_http2_peer_dedup(conn_t *conn);
 // The arena window the peer stated it can host. False when it stated none.
 extern bool rpc_http2_peer_va_window(conn_t *conn, lupine_va_window *window);
 // Returns -1 on failure, 0 for an RPC connection, and a positive value when

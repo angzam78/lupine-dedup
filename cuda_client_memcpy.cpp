@@ -27,6 +27,7 @@
 
 #include "cache.h"
 #include "client_routing.h"
+#include "dedup_protocol.h"
 #include "codegen/gen_rpc_ids.h"
 #include "cuda_client_memcpy.h"
 #include "events.h"
@@ -63,6 +64,9 @@ static bool lupine_device_copy_uses_remote_callback(CUdeviceptr destination,
 static CUresult lupine_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
                                  uint64_t destination, const void *source,
                                  size_t bytes, bool to_host);
+static CUresult lupine_dedup_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
+                                       uint64_t destination,
+                                       const void *source, size_t bytes);
 static constexpr size_t LUPINE_BULK_COPY_MIN_BYTES = 8 * 1024 * 1024;
 
 static bool lupine_stream_crosses_route(CUstream stream, lupine_route route) {
@@ -3732,6 +3736,175 @@ static CUresult lupine_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
   return return_value;
 }
 
+
+static CUresult lupine_dedup_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
+                                       uint64_t destination, const void *source,
+                                       size_t bytes) {
+  static std::atomic<uint64_t> next_copy_id{1};
+  size_t chunks = lupine_dedup_chunk_count(bytes);
+  if (chunks == 0 || chunks > LUPINE_DEDUP_MAX_CHUNKS ||
+      pthread_mutex_lock(&lanes->mutex) != 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+
+  uint64_t copy_id = next_copy_id.fetch_add(1);
+  const auto *data = static_cast<const unsigned char *>(source);
+  std::vector<lupine_dedup_key> hashes(chunks);
+  std::vector<lupine_dedup_record_header> hash_headers(chunks);
+  std::vector<lupine_dedup_hash_record> hash_records(chunks);
+  for (size_t index = 0; index < chunks; ++index) {
+    size_t offset = index * LUPINE_DEDUP_CHUNK_BYTES;
+    size_t chunk_bytes = std::min(static_cast<size_t>(LUPINE_DEDUP_CHUNK_BYTES),
+                                  bytes - offset);
+    hashes[index] = lupine_dedup_hash(data + offset, chunk_bytes);
+    hash_headers[index] = {LUPINE_DEDUP_HASH, 0,
+                           LUPINE_DEDUP_PROTOCOL_VERSION,
+                           static_cast<uint32_t>(sizeof(lupine_dedup_hash_record))};
+    hash_records[index] = {index, offset, hashes[index].bytes,
+                           hashes[index].hash_low, hashes[index].hash_high};
+  }
+
+  lupine_dedup_begin begin = {};
+  begin.copy_id = copy_id;
+  begin.version = LUPINE_DEDUP_PROTOCOL_VERSION;
+  begin.total_bytes = bytes;
+  begin.destination = destination;
+  begin.chunk_bytes = LUPINE_DEDUP_CHUNK_BYTES;
+  begin.chunk_count = static_cast<uint32_t>(chunks);
+  begin.direction = LUPINE_COPY_DIRECTION_HTOD;
+
+  lupine_dedup_record_header begin_header = {
+      LUPINE_DEDUP_BEGIN, 0, LUPINE_DEDUP_PROTOCOL_VERSION,
+      static_cast<uint32_t>(sizeof(begin))};
+  int request_id = -1;
+  bool request_failed =
+      rpc_write_start_request(conn, LUPINE_RPC_DEDUP_TRANSFER) < 0 ||
+      rpc_write(conn, &begin_header, sizeof(begin_header)) < 0 ||
+      rpc_write(conn, &begin, sizeof(begin)) < 0;
+  for (size_t index = 0; !request_failed && index < chunks; ++index) {
+    request_failed = rpc_write(conn, &hash_headers[index],
+                               sizeof(hash_headers[index])) < 0 ||
+                     rpc_write(conn, &hash_records[index],
+                               sizeof(hash_records[index])) < 0;
+  }
+  lupine_dedup_record_header end = {
+      LUPINE_DEDUP_HASH_END, 0, LUPINE_DEDUP_PROTOCOL_VERSION, 0};
+  if (!request_failed) {
+    request_failed = rpc_write(conn, &end, sizeof(end)) < 0;
+  }
+  if (!request_failed) {
+    request_id = rpc_write_end(conn);
+    if (request_id >= 0) {
+      request_failed = rpc_http2_flush(conn) < 0;
+    } else {
+      request_failed = true;
+    }
+  }
+  if (request_failed) {
+    (void)rpc_read_end(conn);
+    pthread_mutex_unlock(&lanes->mutex);
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+
+  rpc_http2_response_wait_begin(conn);
+  bool response_failed = rpc_read_start(conn, request_id) < 0;
+  rpc_http2_response_wait_end(conn);
+  uint32_t response_bytes = 0;
+  std::vector<unsigned char> response;
+  if (!response_failed &&
+      (rpc_read(conn, &response_bytes, sizeof(response_bytes)) < 0 ||
+       response_bytes > 64u * 1024u * 1024u)) {
+    response_failed = true;
+  }
+  if (!response_failed) {
+    response.resize(response_bytes);
+    response_failed = response_bytes != 0 &&
+                     rpc_read(conn, response.data(), response.size()) < 0;
+  }
+  if (rpc_read_end(conn) < 0) {
+    response_failed = true;
+  }
+  std::vector<size_t> misses;
+  size_t response_offset = 0;
+  while (!response_failed && response_offset < response.size()) {
+    if (response.size() - response_offset <
+        sizeof(lupine_dedup_record_header) +
+            sizeof(lupine_dedup_result_record)) {
+      response_failed = true;
+      break;
+    }
+    auto *header = reinterpret_cast<const lupine_dedup_record_header *>(
+        response.data() + response_offset);
+    response_offset += sizeof(*header);
+    auto *result = reinterpret_cast<const lupine_dedup_result_record *>(
+        response.data() + response_offset);
+    response_offset += sizeof(*result);
+    if (header->version != LUPINE_DEDUP_PROTOCOL_VERSION ||
+        header->length != sizeof(*result) || result->sequence >= chunks) {
+      response_failed = true;
+      break;
+    }
+    if (header->type == LUPINE_DEDUP_MISS) {
+      misses.push_back(static_cast<size_t>(result->sequence));
+    } else if (header->type != LUPINE_DEDUP_HIT) {
+      response_failed = true;
+    }
+  }
+  if (response_offset != response.size()) {
+    response_failed = true;
+  }
+  if (response_failed) {
+    pthread_mutex_unlock(&lanes->mutex);
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+
+  std::atomic<size_t> next_miss{0};
+  std::atomic<bool> uploaded{true};
+  auto feed = [&](unsigned int lane) {
+    while (uploaded) {
+      size_t position = next_miss.fetch_add(1);
+      if (position >= misses.size()) {
+        return;
+      }
+      size_t sequence = misses[position];
+      size_t offset = sequence * LUPINE_DEDUP_CHUNK_BYTES;
+      size_t chunk_bytes = static_cast<size_t>(hashes[sequence].bytes);
+      lupine_dedup_bulk_chunk_header header = {
+          2, LUPINE_RPC_DEDUP_BULK_CHUNK, copy_id, sequence, bytes, offset,
+          chunk_bytes, hashes[sequence].hash_low, hashes[sequence].hash_high};
+      std::vector<rpc_write_cursor> cursors = {
+          rpc_write_cursor(&header, sizeof(header)),
+          rpc_write_cursor(data + offset, chunk_bytes)};
+      if (rpc_http2_write_stream(lanes->conn[lane], lanes->stream[lane],
+                                 cursors) < 0) {
+        uploaded = false;
+      }
+    }
+  };
+  std::vector<std::thread> feeders;
+  for (unsigned int lane = 1; lane < lanes->count; ++lane) {
+    feeders.emplace_back(feed, lane);
+  }
+  feed(0);
+  for (auto &feeder : feeders) {
+    feeder.join();
+  }
+  if (!uploaded) {
+    lanes->failed = true;
+  }
+  pthread_mutex_unlock(&lanes->mutex);
+
+  CUresult result = CUDA_ERROR_DEVICE_UNAVAILABLE;
+  if (uploaded && rpc_write_start_request(conn, LUPINE_RPC_DEDUP_COMMIT) == 0 &&
+      rpc_write(conn, &copy_id, sizeof(copy_id)) == 0 &&
+      rpc_wait_for_response(conn) == 0 &&
+      rpc_read(conn, &result, sizeof(result)) == sizeof(result) &&
+      rpc_read_end(conn) >= 0) {
+    return result;
+  }
+  return CUDA_ERROR_DEVICE_UNAVAILABLE;
+}
+
 extern "C" CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
                                     size_t ByteCount) {
   lupine_route route = lupine_route_for_deviceptr(dstDevice);
@@ -3763,10 +3936,15 @@ extern "C" CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
     lanes = lupine_client_transport_bulk_lanes(conn);
   }
   if (lanes != nullptr) {
-    return_value = lupine_prepare_rpc(conn) < 0
-                       ? CUDA_ERROR_DEVICE_UNAVAILABLE
-                       : lupine_bulk_push(conn, lanes, dstDevice, srcHost,
-                                          ByteCount, false);
+    if (lupine_prepare_rpc(conn) < 0) {
+      return_value = CUDA_ERROR_DEVICE_UNAVAILABLE;
+    } else if (rpc_http2_peer_dedup(conn)) {
+      return_value = lupine_dedup_bulk_push(conn, lanes, dstDevice, srcHost,
+                                            ByteCount);
+    } else {
+      return_value = lupine_bulk_push(conn, lanes, dstDevice, srcHost,
+                                      ByteCount, false);
+    }
   } else if (lupine_prepare_rpc(conn) < 0 ||
              rpc_write_start_request(conn, RPC_cuMemcpyHtoD_v2) < 0 ||
              rpc_write(conn, &is_server_authoritative,
