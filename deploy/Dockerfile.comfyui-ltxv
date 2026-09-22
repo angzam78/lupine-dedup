@@ -28,6 +28,8 @@ RUN cmake -S /opt/lupine-src -B /opt/lupine-src/build \
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
+COPY --from=lupine-client-build /opt/lupine/lib /opt/lupine/lib
+
 ARG TORCH_CUDA_INDEX
 ARG COMFYUI_REF=master
 ARG COMFYUI_MANAGER_REF=main
