@@ -53,6 +53,9 @@ CUresult lupine_server_allocate_managed(
 CUresult
 lupine_server_free_device_allocation(CUdeviceptr pointer,
                                      CUresult (*native_free)(CUdeviceptr));
+CUresult lupine_server_enqueue_dedup_htod_async(CUstream stream,
+                                                CUdeviceptr destination,
+                                                void *data, size_t bytes);
 
 struct lupine_graph_host_copy {
   void *client_dst = nullptr;

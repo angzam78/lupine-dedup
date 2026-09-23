@@ -1866,6 +1866,49 @@ lupine_make_3d_htod_copy(const CUDA_MEMCPY3D &original) {
   return copy;
 }
 
+struct lupine_dedup_async_free {
+  unsigned char *data = nullptr;
+};
+
+static void CUDA_CB lupine_delete_dedup_async_data(void *opaque) {
+  auto *owned = static_cast<lupine_dedup_async_free *>(opaque);
+  if (owned != nullptr) {
+    delete[] owned->data;
+    delete owned;
+  }
+}
+
+CUresult lupine_server_enqueue_dedup_htod_async(CUstream stream,
+                                                CUdeviceptr destination,
+                                                void *data, size_t bytes) {
+  auto *owned = static_cast<unsigned char *>(data);
+  if (owned == nullptr || bytes == 0) {
+    delete[] owned;
+    return bytes == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+  }
+
+  CUresult result = cuMemcpyHtoDAsync_v2(destination, owned, bytes, stream);
+  if (result != CUDA_SUCCESS) {
+    delete[] owned;
+    return result;
+  }
+
+  auto *callback = new (std::nothrow) lupine_dedup_async_free{owned};
+  if (callback == nullptr) {
+    (void)cuStreamSynchronize(stream);
+    delete[] owned;
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
+  result = cuLaunchHostFunc(stream, lupine_delete_dedup_async_data, callback);
+  if (result != CUDA_SUCCESS) {
+    (void)cuStreamSynchronize(stream);
+    delete[] owned;
+    delete callback;
+  }
+  return result;
+}
+
+
 static void lupine_server_forget_context_metadata(lupine_staging_state &state,
                                                   CUcontext context) {
   state.created_contexts.erase(context);

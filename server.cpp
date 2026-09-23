@@ -193,11 +193,14 @@ int rpc_server_dispatch(const rpc_handler_registry &handlers, conn_t *conn,
   if (op == LUPINE_RPC_DEDUP_BULK_CHUNK) {
     return handle_lupineDedupBulkChunk(conn);
   }
-  if (op == LUPINE_RPC_DEDUP_TRANSFER || op == LUPINE_RPC_DEDUP_COMMIT) {
+  if (op == LUPINE_RPC_DEDUP_TRANSFER || op == LUPINE_RPC_DEDUP_COMMIT ||
+      op == LUPINE_RPC_DEDUP_COMMIT_ASYNC) {
     lupine_checkpoint::cuda_call_guard guard;
     int result = op == LUPINE_RPC_DEDUP_TRANSFER
                      ? handle_lupineDedupTransfer(conn)
-                     : handle_lupineDedupCommit(conn);
+                     : op == LUPINE_RPC_DEDUP_COMMIT
+                           ? handle_lupineDedupCommit(conn)
+                           : handle_lupineDedupCommitAsync(conn);
     return result >= 0 ? 0 : -1;
   }
 #endif

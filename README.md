@@ -75,21 +75,38 @@ LUPINE can deduplicate repeated large synchronous pageable host-to-device (HtoD)
 transfers over the existing HTTP/2 bulk lanes. The client negotiates a manifest
 of 4 MiB chunks using streamed XXH64-derived keys. Chunks already present on the
 server are reused; missing chunks are uploaded and admitted to the persistent
-server cache. If the cache is not configured, the peer does not advertise
-support, or negotiation fails, the transfer uses the existing bulk path.
+server cache. The cache is enabled by default; set
+`LUPINE_DEDUP_CACHE_SIZE=0` to disable it. If negotiation fails, the transfer
+uses the existing bulk path.
 
-Enable the cache on the GPU server with both variables:
+The GPU server enables a local deduplication cache by default at
+`/var/cache/lupine/dedup` with a `32GiB` capacity. Override the defaults with:
 
 ```bash
 LUPINE_DEDUP_CACHE_DIR=/var/cache/lupine/dedup \
-LUPINE_DEDUP_CACHE_SIZE=64GiB \
+LUPINE_DEDUP_CACHE_SIZE=32GiB \
 ./build/lupine_driver_server
 ```
 
-`LUPINE_DEDUP_CACHE_SIZE` accepts bytes or binary capacity suffixes such as
+Set `LUPINE_DEDUP_CACHE_SIZE=0` to disable the cache. The size accepts bytes or
+binary capacity suffixes such as
 `K`, `M`, `G`, `T`, `KiB`, `MiB`, `GiB`, and `TiB`. The server creates the cache
 directory when needed. The cache is server-local and should be placed on storage
 with enough capacity for the repeated transfer working set.
+
+Cache writes are persisted asynchronously through a bounded queue. The queue
+limit defaults to `1GiB` and can be changed with
+`LUPINE_DEDUP_CACHE_QUEUE_SIZE`; a full queue skips cache admission without
+blocking or failing the transfer.
+
+Set `LUPINE_DEDUP_CACHE_VERIFY=1` to enable full-payload integrity hashing on
+cache hits; the default is `0` for production performance. This trades bit-rot
+and corruption detection for lower CPU usage and should only be used with
+trusted, disposable cache storage when left disabled.
+
+Set `LUPINE_DEDUP_PROFILE=1` to periodically log cache-read timing breakdowns
+for file I/O, LZ4 decompression, integrity hashing, and LRU timestamp updates.
+Profiling is disabled by default.
 
 Deduplication is intentionally limited to large synchronous contiguous pageable
 HtoD transfers that already use bulk lanes. Small transfers, device-to-host

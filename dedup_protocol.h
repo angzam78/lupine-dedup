@@ -13,6 +13,12 @@ static constexpr uint32_t LUPINE_DEDUP_MAX_CHUNKS = 4u * 1024u * 1024u;
 static constexpr int LUPINE_RPC_DEDUP_TRANSFER = 0x4c445450;
 static constexpr int LUPINE_RPC_DEDUP_BULK_CHUNK = 0x4c444243;
 static constexpr int LUPINE_RPC_DEDUP_COMMIT = 0x4c44434d;
+static constexpr int LUPINE_RPC_DEDUP_COMMIT_ASYNC = 0x4c444341;
+
+enum : uint8_t {
+  LUPINE_DEDUP_COMPRESSION_NONE = 0,
+  LUPINE_DEDUP_COMPRESSION_LZ4 = 1,
+};
 
 enum : uint8_t {
   LUPINE_DEDUP_BEGIN = 1,
@@ -87,6 +93,8 @@ struct lupine_dedup_bulk_chunk_header {
   uint64_t bytes;
   uint64_t hash_low;
   uint64_t hash_high;
+  uint8_t compression;
+  uint8_t reserved[7];
 };
 
 inline lupine_dedup_key lupine_dedup_hash(const void *data, size_t bytes) {

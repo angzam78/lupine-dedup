@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,7 @@ extern std::atomic<int> lupine_active_stream_captures;
 #include "lupine_attr_sizes.h"
 #include "lupine_log.h"
 #include "third_party/libcuckoo/libcuckoo/cuckoohash_map.hh"
+#include "third_party/lz4/lib/lz4.h"
 
 static void lupine_pointer_attribute_cache_clear();
 #include "rpc.h"
@@ -66,7 +68,9 @@ static CUresult lupine_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
                                  size_t bytes, bool to_host);
 static CUresult lupine_dedup_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
                                        uint64_t destination,
-                                       const void *source, size_t bytes);
+                                       const void *source, size_t bytes,
+                                       uint8_t direction, CUstream stream,
+                                       bool asynchronous);
 static constexpr size_t LUPINE_BULK_COPY_MIN_BYTES = 8 * 1024 * 1024;
 
 static bool lupine_stream_crosses_route(CUstream stream, lupine_route route) {
@@ -814,6 +818,32 @@ lupine_expose_host_device_pointer(void *host,
   lupine_require_dirty_host_flush();
 }
 
+static void lupine_prepare_host_source_range(const void *source, size_t bytes) {
+  if (source == nullptr || bytes == 0) {
+    return;
+  }
+  uintptr_t start = reinterpret_cast<uintptr_t>(source);
+  if (start > UINTPTR_MAX - bytes) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(lupine_host_allocation_mutex());
+  auto it = lupine_find_host_allocation_locked(const_cast<void *>(source));
+  if (it == lupine_mutable_host_allocations_locked().end()) {
+    return;
+  }
+  uintptr_t base = reinterpret_cast<uintptr_t>(it->first);
+  size_t offset = start - base;
+  if (offset > it->second.size || bytes > it->second.size - offset) {
+    return;
+  }
+  // Do not protect an ordinary pinned source: file readers may still write it
+  // with pread(2) while the caller prepares an asynchronous device copy.
+  it->second.device_pointer_exposed = true;
+  lupine_require_dirty_host_flush();
+  LUPINE_TRACE_LOG("LUPINE prepared HtoD host source bytes=" << bytes);
+}
+
+
 static std::vector<lupine_mapped_host_snapshot> lupine_mapped_host_snapshots() {
   std::vector<lupine_mapped_host_snapshot> snapshots;
   std::lock_guard<std::mutex> lock(lupine_host_allocation_mutex());
@@ -1232,6 +1262,7 @@ static CUresult lupine_flush_dirty_host_pages_to_route(size_t route_id) {
   // travelling on the session connection; the batch ahead of them goes first
   // only so a batch never straddles one.
   uint32_t count = 0;
+  bool peer_dedup = rpc_http2_peer_dedup(conn);
   for (const auto &range : merged) {
     auto &allocation = *range.allocation;
     uintptr_t data_start = allocation.host_base + allocation.data_offset;
@@ -1261,7 +1292,19 @@ static CUresult lupine_flush_dirty_host_pages_to_route(size_t route_id) {
       CUresult result = send_batch(count);
       count = 0;
       if (result == CUDA_SUCCESS) {
-        result = lupine_bulk_push(conn, lanes, dst, source, bytes, true);
+        if (peer_dedup) {
+          LUPINE_TRACE_LOG("LUPINE dirty host flush dedup bytes=" << bytes);
+          result = lupine_dedup_bulk_push(
+              conn, lanes, dst, source, bytes, LUPINE_COPY_DIRECTION_HTOH,
+              CU_STREAM_LEGACY, false);
+          if (result != CUDA_SUCCESS) {
+            LUPINE_TRACE_LOG(
+                "LUPINE dirty host flush dedup failed; falling back to bulk");
+            result = lupine_bulk_push(conn, lanes, dst, source, bytes, true);
+          }
+        } else {
+          result = lupine_bulk_push(conn, lanes, dst, source, bytes, true);
+        }
       }
       if (result != CUDA_SUCCESS) {
         release_ranges(true);
@@ -3739,7 +3782,8 @@ static CUresult lupine_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
 
 static CUresult lupine_dedup_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
                                        uint64_t destination, const void *source,
-                                       size_t bytes) {
+                                       size_t bytes, uint8_t direction,
+                                       CUstream stream, bool asynchronous) {
   static std::atomic<uint64_t> next_copy_id{1};
   size_t chunks = lupine_dedup_chunk_count(bytes);
   if (chunks == 0 || chunks > LUPINE_DEDUP_MAX_CHUNKS ||
@@ -3771,7 +3815,7 @@ static CUresult lupine_dedup_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
   begin.destination = destination;
   begin.chunk_bytes = LUPINE_DEDUP_CHUNK_BYTES;
   begin.chunk_count = static_cast<uint32_t>(chunks);
-  begin.direction = LUPINE_COPY_DIRECTION_HTOD;
+  begin.direction = direction;
 
   lupine_dedup_record_header begin_header = {
       LUPINE_DEDUP_BEGIN, 0, LUPINE_DEDUP_PROTOCOL_VERSION,
@@ -3869,12 +3913,38 @@ static CUresult lupine_dedup_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
       size_t sequence = misses[position];
       size_t offset = sequence * LUPINE_DEDUP_CHUNK_BYTES;
       size_t chunk_bytes = static_cast<size_t>(hashes[sequence].bytes);
-      lupine_dedup_bulk_chunk_header header = {
-          2, LUPINE_RPC_DEDUP_BULK_CHUNK, copy_id, sequence, bytes, offset,
-          chunk_bytes, hashes[sequence].hash_low, hashes[sequence].hash_high};
+      std::vector<unsigned char> encoded;
+      uint8_t compression = LUPINE_DEDUP_COMPRESSION_NONE;
+      if (chunk_bytes <= static_cast<size_t>(INT_MAX)) {
+        int bound = LZ4_compressBound(static_cast<int>(chunk_bytes));
+        encoded.resize(static_cast<size_t>(bound));
+        int compressed = LZ4_compress_default(
+            reinterpret_cast<const char *>(data + offset),
+            reinterpret_cast<char *>(encoded.data()), static_cast<int>(chunk_bytes),
+            bound);
+        if (compressed > 0 && static_cast<size_t>(compressed) < chunk_bytes) {
+          encoded.resize(static_cast<size_t>(compressed));
+          compression = LUPINE_DEDUP_COMPRESSION_LZ4;
+        } else {
+          encoded.assign(data + offset, data + offset + chunk_bytes);
+        }
+      } else {
+        encoded.assign(data + offset, data + offset + chunk_bytes);
+      }
+      lupine_dedup_bulk_chunk_header header = {};
+      header.request_id = 2;
+      header.op = LUPINE_RPC_DEDUP_BULK_CHUNK;
+      header.copy_id = copy_id;
+      header.sequence = sequence;
+      header.total_bytes = bytes;
+      header.offset = offset;
+      header.bytes = encoded.size();
+      header.hash_low = hashes[sequence].hash_low;
+      header.hash_high = hashes[sequence].hash_high;
+      header.compression = compression;
       std::vector<rpc_write_cursor> cursors = {
           rpc_write_cursor(&header, sizeof(header)),
-          rpc_write_cursor(data + offset, chunk_bytes)};
+          rpc_write_cursor(encoded.data(), encoded.size())};
       if (rpc_http2_write_stream(lanes->conn[lane], lanes->stream[lane],
                                  cursors) < 0) {
         uploaded = false;
@@ -3895,8 +3965,11 @@ static CUresult lupine_dedup_bulk_push(conn_t *conn, lupine_bulk_lanes *lanes,
   pthread_mutex_unlock(&lanes->mutex);
 
   CUresult result = CUDA_ERROR_DEVICE_UNAVAILABLE;
-  if (uploaded && rpc_write_start_request(conn, LUPINE_RPC_DEDUP_COMMIT) == 0 &&
+  int commit_opcode = asynchronous ? LUPINE_RPC_DEDUP_COMMIT_ASYNC
+                                   : LUPINE_RPC_DEDUP_COMMIT;
+  if (uploaded && rpc_write_start_request(conn, commit_opcode) == 0 &&
       rpc_write(conn, &copy_id, sizeof(copy_id)) == 0 &&
+      (!asynchronous || rpc_write(conn, &stream, sizeof(stream)) == 0) &&
       rpc_wait_for_response(conn) == 0 &&
       rpc_read(conn, &result, sizeof(result)) == sizeof(result) &&
       rpc_read_end(conn) >= 0) {
@@ -3921,6 +3994,7 @@ extern "C" CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
     return CUDA_ERROR_INVALID_VALUE;
   }
   conn_t *conn = lupine_route_remote_conn(route);
+  lupine_prepare_host_source_range(srcHost, ByteCount);
   CUdeviceptr server_source = 0;
   bool is_server_authoritative = lupine_translate_client_host_range_to_server(
       &server_source, srcHost, ByteCount, lupine_route_identity(route));
@@ -3939,8 +4013,9 @@ extern "C" CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
     if (lupine_prepare_rpc(conn) < 0) {
       return_value = CUDA_ERROR_DEVICE_UNAVAILABLE;
     } else if (rpc_http2_peer_dedup(conn)) {
-      return_value = lupine_dedup_bulk_push(conn, lanes, dstDevice, srcHost,
-                                            ByteCount);
+      return_value = lupine_dedup_bulk_push(
+          conn, lanes, dstDevice, srcHost, ByteCount,
+          LUPINE_COPY_DIRECTION_HTOD, CU_STREAM_LEGACY, false);
     } else {
       return_value = lupine_bulk_push(conn, lanes, dstDevice, srcHost,
                                       ByteCount, false);
@@ -3989,6 +4064,7 @@ extern "C" CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
     return CUDA_ERROR_INVALID_VALUE;
   }
   conn_t *conn = lupine_route_remote_conn(route);
+  lupine_prepare_host_source_range(srcHost, ByteCount);
   CUdeviceptr server_source = 0;
   bool is_server_authoritative = lupine_translate_client_host_range_to_server(
       &server_source, srcHost, ByteCount, lupine_route_identity(route));
@@ -3997,9 +4073,32 @@ extern "C" CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
                                 : srcHost;
   uint64_t pushed_bytes =
       lupine_htod_pushed_bytes(is_server_authoritative, srcHost, ByteCount);
+  if (lupine_prepare_rpc(conn) < 0) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+
+  bool dedup_eligible =
+      pushed_bytes == ByteCount && ByteCount >= LUPINE_BULK_COPY_MIN_BYTES &&
+      lupine_active_stream_captures.load(std::memory_order_relaxed) == 0 &&
+      !lupine_device_copy_uses_remote_callback(
+          dstDevice, reinterpret_cast<CUdeviceptr>(srcHost));
+  bool peer_dedup = rpc_http2_peer_dedup(conn);
+  LUPINE_TRACE_LOG("LUPINE HtoDAsync bytes=" << ByteCount
+                                               << " pushed=" << pushed_bytes
+                                               << " eligible=" << dedup_eligible
+                                               << " peer_dedup=" << peer_dedup);
+  if (dedup_eligible && peer_dedup) {
+    lupine_bulk_lanes *lanes = lupine_client_transport_bulk_lanes(conn);
+    LUPINE_TRACE_LOG("LUPINE HtoDAsync dedup lanes="
+                     << (lanes == nullptr ? 0 : lanes->count));
+    if (lanes != nullptr) {
+      return lupine_dedup_bulk_push(conn, lanes, dstDevice, srcHost, ByteCount,
+                                    LUPINE_COPY_DIRECTION_HTOD, hStream, true);
+    }
+  }
+
   CUresult return_value = CUDA_ERROR_DEVICE_UNAVAILABLE;
-  if (lupine_prepare_rpc(conn) < 0 ||
-      rpc_write_start_request(conn, RPC_cuMemcpyHtoDAsync_v2) < 0 ||
+  if (rpc_write_start_request(conn, RPC_cuMemcpyHtoDAsync_v2) < 0 ||
       rpc_write(conn, &is_server_authoritative,
                 sizeof(is_server_authoritative)) < 0 ||
       rpc_write(conn, &dstDevice, sizeof(dstDevice)) < 0 ||
