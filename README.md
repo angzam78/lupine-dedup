@@ -115,14 +115,14 @@ their existing behavior.
 
 ## ComfyUI client image
 
-`deploy/Dockerfile.comfyui-ltxv` builds a CPU-side image containing ComfyUI,
+`deploy/Dockerfile.comfyui` builds a CPU-side image containing ComfyUI,
 ComfyUI-Manager, and the LUPINE CUDA driver shim. It deliberately does not
 clone LTXV or VideoHelperSuite nodes and does not download model weights; add
 those through Manager or a mounted model/custom-node volume after the image is
 built. ComfyUI listens on container port `1234`.
 
 ```bash
-docker build -f deploy/Dockerfile.comfyui-ltxv \
+docker build -f deploy/Dockerfile.comfyui \
   -t lupine-comfyui:latest .
 docker run --rm \
   -p 1234:1234 \

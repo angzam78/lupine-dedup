@@ -1,34 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-ARG CUDA_VERSION=12.8.0
-ARG UBUNTU_VERSION=24.04
+ARG LUPINE_CLIENT_IMAGE=lupine-dedup-client:cuda-12.8.1-ubuntu24.04
 ARG TORCH_CUDA_INDEX=cu128
 
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS lupine-client-build
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        cmake \
-        libnghttp2-dev \
-        libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /opt/lupine-src
-COPY . /opt/lupine-src
-
-RUN cmake -S /opt/lupine-src -B /opt/lupine-src/build \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
-    && cmake --build /opt/lupine-src/build --parallel --target lupine_cuda_client \
-    && mkdir -p /opt/lupine/lib \
-    && cp /opt/lupine-src/build/libcuda.so.1 /opt/lupine/lib/libcuda.so.1 \
-    && ln -sf libcuda.so.1 /opt/lupine/lib/libcuda.so
-
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
-
-COPY --from=lupine-client-build /opt/lupine/lib /opt/lupine/lib
+FROM ${LUPINE_CLIENT_IMAGE}
 
 ARG TORCH_CUDA_INDEX
 ARG COMFYUI_REF=master
@@ -77,9 +52,9 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir \
         -r custom_nodes/ComfyUI-Manager/requirements.txt
 
-COPY deploy/entrypoint-comfyui-ltxv.sh /usr/local/bin/entrypoint-comfyui-ltxv
-RUN chmod 0755 /usr/local/bin/entrypoint-comfyui-ltxv
+COPY deploy/entrypoint-comfyui.sh /usr/local/bin/entrypoint-comfyui
+RUN chmod 0755 /usr/local/bin/entrypoint-comfyui
 
 EXPOSE 1234
-ENTRYPOINT ["/usr/local/bin/entrypoint-comfyui-ltxv"]
+ENTRYPOINT ["/usr/local/bin/entrypoint-comfyui"]
 CMD ["--listen", "0.0.0.0", "--port", "1234"]
