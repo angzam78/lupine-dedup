@@ -121,17 +121,68 @@ clone LTXV or VideoHelperSuite nodes and does not download model weights; add
 those through Manager or a mounted model/custom-node volume after the image is
 built. ComfyUI listens on container port `1234`.
 
+The image targets share a common runtime hierarchy:
+
+```text
+runtime-base
+├── client
+│   └── ComfyUI client image
+└── server
+```
+
+`runtime-base` contains only the common Ubuntu runtime packages. The client
+adds the LUPINE forwarding shims, and the server adds its native server
+runtime. This keeps the client and server image manifests independent while
+allowing BuildKit and registries to reuse identical base layers. The ComfyUI
+image must inherit from the client image so it also reuses the client layers.
+`deploy/Dockerfile.comfyui` uses a separate builder stage, keeping compilers,
+Git metadata, and system build packages out of the final image while retaining
+the runtime libraries, FFmpeg, and Python packages required by ComfyUI.
+
+Build the client and ComfyUI extension images reproducibly from the repository root:
+
 ```bash
-docker build -f deploy/Dockerfile.comfyui \
-  -t lupine-comfyui:latest .
+docker buildx build --load \
+  --target client \
+  --build-arg CUDA_VERSION=12.8.1 \
+  --build-arg UBUNTU_VERSION=24.04 \
+  -t lupine-client:cuda-12.8.1-ubuntu24.04 .
+
+docker buildx build --load \
+  --file deploy/Dockerfile.comfyui \
+  --build-arg LUPINE_CLIENT_IMAGE=lupine-client:cuda-12.8.1-ubuntu24.04 \
+  -t lupine-comfyui:cuda-12.8.1-ubuntu24.04 .
+```
+
+The server target requires the staged native client bundles described in the
+[Client compatibility](#client-compatibility) section. Once those artifacts
+are available under `client-libs`, build the server from the same checkout:
+
+```bash
+docker buildx build --load \
+  --target server \
+  --build-arg CUDA_VERSION=12.8.1 \
+  --build-arg UBUNTU_VERSION=24.04 \
+  --build-arg LUPINE_CLIENT_BUNDLE_INPUT=/opt/lupine/client-libs \
+  -t lupine-server:cuda-12.8.1-ubuntu24.04 \
+  .
+```
+
+The `client-libs` directory is part of the build context and is copied into
+`/opt/lupine` by the repository Dockerfile. CI uses the same input contract
+after downloading the native-client artifacts.
+
+Run the ComfyUI extension image with no GPU device request:
+
+```bash
 docker run --rm \
   -p 1234:1234 \
   -e LUPINE_SERVER=<gpu-server>:14833 \
-  lupine-comfyui:latest
+  lupine-comfyui:cuda-12.8.1-ubuntu24.04
 ```
 
-Open `http://localhost:1234`. The client container does not need `--gpus all`;
-CUDA calls are sent through the LUPINE shim to the remote GPU server.
+Open `http://localhost:1234`. CUDA calls are sent through the LUPINE shim to
+the remote GPU server.
 
 ## Client compatibility
 

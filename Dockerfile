@@ -125,9 +125,23 @@ RUN test -n "${LUPINE_CLIENT_BUNDLE_INPUT}"
 
 RUN cmake --build /opt/lupine/build --parallel --target lupine_driver_server
 
-FROM ubuntu:${UBUNTU_VERSION} AS client
+# Keep the common runtime layer identical for client and server. BuildKit and
+# registries can then reuse these layers across both image manifests.
+FROM ubuntu:${UBUNTU_VERSION} AS runtime-base
 
 ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    libgcc-s1 \
+    libnghttp2-14 \
+    libstdc++6 \
+    && (apt-get install -y --no-install-recommends libssl3 || apt-get install -y --no-install-recommends libssl3t64) \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM runtime-base AS client
+
 ARG CUDA_VERSION
 ARG NVIDIA_UTILS_PACKAGE=nvidia-utils-535
 ARG NVIDIA_UTILS_VERSION=
@@ -138,16 +152,6 @@ LABEL org.opencontainers.image.title="lupine-client"
 LABEL org.opencontainers.image.description="LUPINE client runtime with CUDA driver, NCCL, nvSHMEM, NVML, and HIP shims"
 LABEL org.opencontainers.image.source="https://github.com/lupinemachines/lupine"
 LABEL org.opencontainers.image.version="${CUDA_VERSION}-rocm-${ROCM_VERSION}-ubuntu${UBUNTU_VERSION}"
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    ca-certificates \
-    libgcc-s1 \
-    libnghttp2-14 \
-    libstdc++6 \
-    # libssl3 on jammy, libssl3t64 on noble.
-    && (apt-get install -y --no-install-recommends libssl3 || apt-get install -y --no-install-recommends libssl3t64) \
-    && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu periodically turns an older nvidia-utils-NNN into an empty
 # transitional package (Depends on a newer NNN, no binaries of its own) as
@@ -196,7 +200,7 @@ ENV LD_LIBRARY_PATH=/opt/lupine/lib
 ENTRYPOINT []
 CMD ["bash"]
 
-FROM ubuntu:${UBUNTU_VERSION} AS server
+FROM runtime-base AS server
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG AMDGPU_INSTALL_VERSION=7.2.4.70204-1
@@ -210,18 +214,10 @@ LABEL org.opencontainers.image.description="LUPINE CUDA and ROCm server runtime"
 LABEL org.opencontainers.image.source="https://github.com/lupinemachines/lupine"
 LABEL org.opencontainers.image.version="${CUDA_VERSION}-rocm-${ROCM_VERSION}-ubuntu${UBUNTU_VERSION}"
 
-# NVIDIA's container runtime supplies the host driver ahead of the compatibility
-# library in LD_LIBRARY_PATH. The compatibility package also lets the unified
-# binary start on AMD-only hosts, where no NVIDIA driver is mounted.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    ca-certificates \
-    libgcc-s1 \
-    libnghttp2-14 \
-    libstdc++6 \
-    wget \
-    # libssl3 on jammy, libssl3t64 on noble.
-    && (apt-get install -y --no-install-recommends libssl3 || apt-get install -y --no-install-recommends libssl3t64) \
+# NVIDIA server containers must prefer the host driver mounted by the NVIDIA
+# container runtime. Keep cuda-compat only as a fallback for AMD-only hosts;
+# never put its user-space driver ahead of the host driver or CUDA can return 803.
+RUN apt-get update && apt-get install -y --no-install-recommends wget \
     && arch="$(dpkg --print-architecture)" \
     && case "$arch" in \
          amd64) cuda_repo_arch=x86_64 ;; \
@@ -255,7 +251,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=server-build /opt/lupine/build/lupine_driver_server /opt/lupine/bin/lupine_driver_server
 
-ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/compat:/usr/local/cuda/lib64:/opt/rocm/lib
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/lib64:/opt/rocm/lib
 ENV LUPINE_PORT=14833
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility

@@ -1,21 +1,17 @@
 # syntax=docker/dockerfile:1.7
 
-ARG LUPINE_CLIENT_IMAGE=lupine-dedup-client:cuda-12.8.1-ubuntu24.04
+ARG LUPINE_CLIENT_IMAGE=lupine-client:cuda-12.8.1-ubuntu24.04
 ARG TORCH_CUDA_INDEX=cu128
 
-FROM ${LUPINE_CLIENT_IMAGE}
+FROM ${LUPINE_CLIENT_IMAGE} AS comfyui-builder
 
 ARG TORCH_CUDA_INDEX
 ARG COMFYUI_REF=master
 ARG COMFYUI_MANAGER_REF=main
 
-ENV PYTHONUNBUFFERED=1 \
-    VIRTUAL_ENV=/opt/venv \
+ENV VIRTUAL_ENV=/opt/venv \
     COMFYUI_ROOT=/app/ComfyUI \
-    LUPINE_LIBCUDA=/opt/lupine/lib/libcuda.so.1 \
-    LUPINE_LIB=/opt/lupine/lib/libcuda.so.1 \
-    PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    LD_LIBRARY_PATH=/opt/lupine/lib:/usr/local/cuda/lib64
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -37,21 +33,45 @@ RUN apt-get update \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir \
         --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_INDEX}" \
-        torch torchvision torchaudio \
-    && pip install --no-cache-dir huggingface_hub
+        torch torchvision torchaudio
 
 WORKDIR /app
 RUN git clone --depth 1 --branch "$COMFYUI_REF" \
         https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_ROOT" \
     && git clone --depth 1 --branch "$COMFYUI_MANAGER_REF" \
         https://github.com/ltdrdata/ComfyUI-Manager.git \
-        "$COMFYUI_ROOT/custom_nodes/ComfyUI-Manager"
+        "$COMFYUI_ROOT/custom_nodes/ComfyUI-Manager" \
+    && rm -rf "$COMFYUI_ROOT/.git" \
+        "$COMFYUI_ROOT/custom_nodes/ComfyUI-Manager/.git"
 
 WORKDIR $COMFYUI_ROOT
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir \
         -r custom_nodes/ComfyUI-Manager/requirements.txt
 
+FROM ${LUPINE_CLIENT_IMAGE} AS comfyui
+
+ENV PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    COMFYUI_ROOT=/app/ComfyUI \
+    LUPINE_LIBCUDA=/opt/lupine/lib/libcuda.so.1 \
+    LUPINE_LIB=/opt/lupine/lib/libcuda.so.1 \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/opt/lupine/lib:/usr/local/cuda/lib64
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=comfyui-builder /opt/venv /opt/venv
+COPY --from=comfyui-builder /app/ComfyUI /app/ComfyUI
 COPY deploy/entrypoint-comfyui.sh /usr/local/bin/entrypoint-comfyui
 RUN chmod 0755 /usr/local/bin/entrypoint-comfyui
 
