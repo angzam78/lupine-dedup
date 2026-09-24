@@ -15,13 +15,13 @@ enum lupine_log_level {
 };
 
 // Verbosity is controlled by the LUPINE_LOG_LEVEL environment variable
-// ("none", "error", or "debug"). The default is "error" for production
-// deployments; use "debug" when detailed diagnostics are needed.
+// ("none", "error", or "debug"). The default is "debug" so existing
+// diagnostics keep printing to stderr exactly as before.
 inline bool lupine_log_enabled(lupine_log_level level) {
   static lupine_log_level configured = [] {
     const char *value = getenv("LUPINE_LOG_LEVEL");
     if (value == nullptr || value[0] == '\0') {
-      return LUPINE_LOG_LEVEL_ERROR;
+      return LUPINE_LOG_LEVEL_DEBUG;
     }
     if (strcmp(value, "none") == 0 || strcmp(value, "0") == 0) {
       return LUPINE_LOG_LEVEL_NONE;
