@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
 ARG LUPINE_CLIENT_IMAGE=lupine-client:cuda-12.8.1-ubuntu24.04
+ARG UBUNTU_VERSION=24.04
 ARG TORCH_CUDA_INDEX=cu128
 
-FROM ${LUPINE_CLIENT_IMAGE} AS comfyui-builder
+FROM ubuntu:${UBUNTU_VERSION} AS comfyui-builder
 
 ARG TORCH_CUDA_INDEX
 ARG COMFYUI_REF=master
@@ -60,6 +61,8 @@ ENV PYTHONUNBUFFERED=1 \
     PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     LD_LIBRARY_PATH=/opt/lupine/lib:/usr/local/cuda/lib64
 
+COPY --from=comfyui-builder /opt/venv /opt/venv
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -72,7 +75,6 @@ RUN apt-get update \
         python3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=comfyui-builder /opt/venv /opt/venv
 COPY --from=comfyui-builder /app/ComfyUI /app/ComfyUI
 COPY deploy/entrypoint-comfyui.sh /usr/local/bin/entrypoint-comfyui
 RUN chmod 0755 /usr/local/bin/entrypoint-comfyui
