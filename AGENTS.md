@@ -13,6 +13,18 @@
 
 These are local deduplication-extension integration-test tags. Keep them separate from the generic published Lupine image names used by the tracked project documentation.
 
+## Build and deployment validation
+
+- Keep the tracked project faithful to Lupine: use generic `lupine-client`, `lupine-comfyui`, and `lupine-server` names in tracked Dockerfiles and documentation. The `angzam78/lupine-dedup-*` names above are local integration-test tags only.
+- The validated local build matrix is CUDA `12.8.1`, Ubuntu `24.04`, and ROCm `7.2.4`. Build the root image with BuildKit/buildx using `--target client` or `--target server`; the server target requires `LUPINE_CLIENT_BUNDLE_INPUT`.
+- Server builds require five native bundle directories under `client-libs`: `lupine-client-linux-x86_64`, `lupine-client-linux-aarch64`, `lupine-client-macosx-universal2`, `lupine-client-win-amd64`, and `lupine-client-win-arm64`. Stage these from official CI artifacts, do not commit them, and remove the temporary directory after building.
+- Build ComfyUI with BuildKit and a target-based build context so it inherits the freshly built client stage; a containerized builder cannot reliably resolve a client image tag from the host Docker image store.
+- `deploy/Dockerfile.comfyui` is multi-stage: the final image must retain Git for ComfyUI-Manager startup, `huggingface_hub`, FFmpeg, graphics libraries, TorchVision, TorchAudio, and the other ComfyUI Python requirements while excluding build-only compilers and metadata.
+- Runtime validation requires the server container to use `--gpus all`. Run the ComfyUI/client container without `--gpus all`, set `LUPINE_SERVER`, and verify that CUDA work is routed remotely rather than executed locally.
+- Useful smoke checks are server `LD_LIBRARY_PATH` ordering and `ldd`, server port acceptance, ComfyUI HTTP readiness from inside the container, and imports of `torch`, `torchvision`, `torchaudio`, and `huggingface_hub`.
+- The CUDA matrix and server-image workflows build on `main`, selected pull requests, or manual dispatch; pushing an arbitrary feature branch alone does not necessarily trigger them.
+
+
 
 ## Deduplication implementation
 
